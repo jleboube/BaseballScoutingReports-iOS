@@ -1,5 +1,8 @@
 import SwiftUI
 import Foundation
+import AuthenticationServices
+import LocalAuthentication
+import Security
 
 // MARK: - Data Models
 struct User: Codable, Identifiable {
@@ -9,6 +12,7 @@ struct User: Codable, Identifiable {
     let email: String
     let groupName: String?
     let isAdmin: Bool
+    let appleIdentifier: String?
 }
 
 struct Team: Codable, Identifiable {
@@ -44,8 +48,9 @@ struct AppUser: Codable, Identifiable {
     var groupName: String?
     var isAdmin: Bool
     let createdAt: Date
+    var appleIdentifier: String?
     
-    init(id: Int, firstName: String, lastName: String, email: String, groupName: String?, isAdmin: Bool = false) {
+    init(id: Int, firstName: String, lastName: String, email: String, groupName: String?, isAdmin: Bool = false, appleIdentifier: String? = nil) {
         self.id = id
         self.firstName = firstName
         self.lastName = lastName
@@ -53,6 +58,7 @@ struct AppUser: Codable, Identifiable {
         self.groupName = groupName
         self.isAdmin = isAdmin
         self.createdAt = Date()
+        self.appleIdentifier = appleIdentifier
     }
 }
 
@@ -213,10 +219,15 @@ class DataManager: ObservableObject {
     
     // MARK: - User Management
     func addUser(_ user: AppUser) {
-        if !users.contains(where: { $0.email == user.email }) {
+        if let index = users.firstIndex(where: {
+            $0.email == user.email ||
+            ($0.appleIdentifier != nil && $0.appleIdentifier == user.appleIdentifier)
+        }) {
+            users[index] = user
+        } else {
             users.append(user)
-            saveUsers()
         }
+        saveUsers()
     }
     
     func updateUserAdminStatus(userId: Int, isAdmin: Bool) {
@@ -230,6 +241,14 @@ class DataManager: ObservableObject {
     
     func getUser(email: String) -> AppUser? {
         return users.first { $0.email == email }
+    }
+    
+    func getUser(id: Int) -> AppUser? {
+        return users.first { $0.id == id }
+    }
+    
+    func getUser(appleIdentifier: String) -> AppUser? {
+        return users.first { $0.appleIdentifier == appleIdentifier }
     }
     
     func deleteUser(id: Int) {
@@ -387,6 +406,7 @@ struct MainTabView: View {
 // MARK: - Authentication View
 struct AuthenticationView: View {
     @State private var showingLogin = true
+    @EnvironmentObject var authService: AuthService
     @EnvironmentObject var dataManager: DataManager
     
     var body: some View {
@@ -410,6 +430,25 @@ struct AuthenticationView: View {
                         .multilineTextAlignment(.center)
                 }
                 
+                VStack(spacing: 12) {
+                    if authService.canUseBiometrics {
+                        BiometricLoginButton()
+                    }
+                    
+                    if let biometricError = authService.biometricError {
+                        Text(biometricError)
+                            .font(.footnote)
+                            .foregroundColor(.red)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 4)
+                    }
+                    
+                    AppleSignInButtonView(isRegistration: !showingLogin)
+                }
+                
+                DividerLabel(text: showingLogin ? "or log in with email" : "or register with email")
+                    .padding(.horizontal)
+                
                 if showingLogin {
                     LoginView(showingLogin: $showingLogin)
                 } else {
@@ -421,6 +460,87 @@ struct AuthenticationView: View {
             .padding()
             .navigationTitle("")
             .navigationBarHidden(true)
+        }
+        .onAppear {
+            authService.refreshBiometricAvailability()
+        }
+    }
+}
+
+struct AppleSignInButtonView: View {
+    @EnvironmentObject var authService: AuthService
+    var isRegistration: Bool
+    
+    var body: some View {
+        SignInWithAppleButton(isRegistration ? .signUp : .signIn) { request in
+            authService.configureAppleRequest(request)
+        } onCompletion: { result in
+            authService.handleAppleSignIn(result: result)
+        }
+        .signInWithAppleButtonStyle(.black)
+        .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+struct BiometricLoginButton: View {
+    @EnvironmentObject var authService: AuthService
+    
+    private var iconName: String {
+        switch authService.biometryType {
+        case .faceID:
+            return "faceid"
+        case .touchID:
+            return "touchid"
+        default:
+            return "lock.fill"
+        }
+    }
+    
+    private var buttonTitle: String {
+        switch authService.biometryType {
+        case .faceID:
+            return "Log in with Face ID"
+        case .touchID:
+            return "Log in with Touch ID"
+        default:
+            return "Use Biometric Login"
+        }
+    }
+    
+    var body: some View {
+        Button {
+            authService.attemptBiometricLogin()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: iconName)
+                Text(buttonTitle)
+                    .fontWeight(.semibold)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.blue)
+    }
+}
+
+struct DividerLabel: View {
+    let text: String
+    
+    var body: some View {
+        HStack {
+            Rectangle()
+                .frame(height: 1)
+                .foregroundColor(Color(.systemGray4))
+            
+            Text(text)
+                .font(.footnote)
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 8)
+            
+            Rectangle()
+                .frame(height: 1)
+                .foregroundColor(Color(.systemGray4))
         }
     }
 }
@@ -1417,6 +1537,153 @@ class AuthService: ObservableObject {
     @Published var currentUser: User?
     @Published var isLoading = false
     @Published var errorMessage: String?
+    @Published var canUseBiometrics = false
+    @Published var biometryType: LABiometryType = .none
+    @Published var biometricError: String?
+    
+    private let dataManager = DataManager.shared
+    private let biometricAuthenticator = BiometricAuthenticator.shared
+    
+    init() {
+        refreshBiometricAvailability()
+    }
+    
+    func configureAppleRequest(_ request: ASAuthorizationAppleIDRequest) {
+        request.requestedScopes = [.fullName, .email]
+    }
+    
+    func handleAppleSignIn(result: Result<ASAuthorization, Error>) {
+        switch result {
+        case .success(let authorization):
+            guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
+                errorMessage = "Unable to process Apple ID credentials."
+                return
+            }
+            Task {
+                await completeAppleSignIn(with: credential)
+            }
+        case .failure(let error):
+            errorMessage = error.localizedDescription
+        }
+    }
+    
+    private func completeAppleSignIn(with credential: ASAuthorizationAppleIDCredential) async {
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        
+        let appleUserId = credential.user
+        
+        if let existingAppleUser = dataManager.getUser(appleIdentifier: appleUserId) {
+            setCurrentUser(from: existingAppleUser)
+            print("Apple Sign In success for existing user: \(existingAppleUser.firstName) \(existingAppleUser.lastName)")
+            return
+        }
+        
+        let providedEmail = credential.email
+        let resolvedEmail = providedEmail ?? "\(appleUserId)@appleid.apple"
+        
+        if let email = providedEmail, var matchedByEmail = dataManager.getUser(email: email) {
+            matchedByEmail.appleIdentifier = appleUserId
+            dataManager.addUser(matchedByEmail)
+            setCurrentUser(from: matchedByEmail)
+            print("Linked existing email user to Apple ID: \(email)")
+            return
+        }
+        
+        if var matchedByPlaceholder = dataManager.getUser(email: resolvedEmail) {
+            matchedByPlaceholder.appleIdentifier = appleUserId
+            dataManager.addUser(matchedByPlaceholder)
+            setCurrentUser(from: matchedByPlaceholder)
+            print("Linked existing placeholder email user to Apple ID: \(resolvedEmail)")
+            return
+        }
+        
+        let firstName = credential.fullName?.givenName ?? "Scout"
+        let lastName = credential.fullName?.familyName ?? "User"
+        
+        let newUser = AppUser(
+            id: Int.random(in: 100...999),
+            firstName: firstName,
+            lastName: lastName,
+            email: resolvedEmail,
+            groupName: nil,
+            isAdmin: false,
+            appleIdentifier: appleUserId
+        )
+        
+        dataManager.addUser(newUser)
+        setCurrentUser(from: newUser)
+        print("Created new user via Apple Sign In: \(firstName) \(lastName)")
+    }
+    
+    private func setCurrentUser(from appUser: AppUser) {
+        currentUser = User(
+            id: appUser.id,
+            firstName: appUser.firstName,
+            lastName: appUser.lastName,
+            email: appUser.email,
+            groupName: appUser.groupName,
+            isAdmin: appUser.isAdmin,
+            appleIdentifier: appUser.appleIdentifier
+        )
+        isAuthenticated = true
+        biometricError = nil
+        storeBiometricCredentials(for: appUser)
+    }
+    
+    func attemptBiometricLogin() {
+        biometricError = nil
+        Task {
+            do {
+                let credentials = try await biometricAuthenticator.authenticate(reason: "Log in to Baseball Scout")
+                handleBiometricSuccess(credentials)
+            } catch let error as BiometricAuthError {
+                if case .authenticationFailed = error {
+                    biometricError = nil
+                } else {
+                    biometricError = error.localizedDescription
+                }
+            } catch {
+                biometricError = error.localizedDescription
+            }
+        }
+    }
+    
+    func refreshBiometricAvailability() {
+        let evaluation = biometricAuthenticator.canEvaluateBiometrics()
+        biometryType = evaluation.type
+        canUseBiometrics = evaluation.available && biometricAuthenticator.hasStoredCredentials()
+    }
+    
+    private func handleBiometricSuccess(_ credentials: BiometricCredentials) {
+        if let user = dataManager.getUser(id: credentials.userId) ??
+            (credentials.appleIdentifier.flatMap { dataManager.getUser(appleIdentifier: $0) }) ??
+            dataManager.getUser(email: credentials.email) {
+            setCurrentUser(from: user)
+        } else {
+            biometricError = "Unable to locate your saved account. Please log in with email once to reset biometrics."
+            biometricAuthenticator.clearCredentials()
+            refreshBiometricAvailability()
+        }
+    }
+    
+    private func storeBiometricCredentials(for appUser: AppUser) {
+        let evaluation = biometricAuthenticator.canEvaluateBiometrics()
+        guard evaluation.available else { return }
+        let credentials = BiometricCredentials(
+            userId: appUser.id,
+            email: appUser.email,
+            appleIdentifier: appUser.appleIdentifier
+        )
+        do {
+            try biometricAuthenticator.store(credentials: credentials)
+            refreshBiometricAvailability()
+        } catch {
+            biometricError = error.localizedDescription
+            refreshBiometricAvailability()
+        }
+    }
     
     func checkAuthenticationStatus() {
         isAuthenticated = false
@@ -1429,25 +1696,17 @@ class AuthService: ObservableObject {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         
         // Check if user exists in our stored users
-        if let storedUser = DataManager.shared.getUser(email: email) {
+        if let storedUser = dataManager.getUser(email: email) {
             // For demo purposes, accept any password for stored users
             if password.count >= 6 {
-                currentUser = User(
-                    id: storedUser.id,
-                    firstName: storedUser.firstName,
-                    lastName: storedUser.lastName,
-                    email: storedUser.email,
-                    groupName: storedUser.groupName,
-                    isAdmin: storedUser.isAdmin
-                )
-                isAuthenticated = true
+                setCurrentUser(from: storedUser)
                 print("\(storedUser.isAdmin ? "Admin" : "User") logged in: \(storedUser.firstName) \(storedUser.lastName)")
             } else {
                 errorMessage = "Password must be at least 6 characters"
             }
         } else if email == "admin@demo.com" && password == "admin123" {
             // Fallback admin account if not in stored users
-            currentUser = User(id: 1, firstName: "Admin", lastName: "User", email: email, groupName: "Demo Team", isAdmin: true)
+            currentUser = User(id: 1, firstName: "Admin", lastName: "User", email: email, groupName: "Demo Team", isAdmin: true, appleIdentifier: nil)
             isAuthenticated = true
             print("Fallback admin user logged in successfully")
         } else {
@@ -1464,17 +1723,17 @@ class AuthService: ObservableObject {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         
         // Check if user already exists
-        if DataManager.shared.getUser(email: email) != nil {
+        if dataManager.getUser(email: email) != nil {
             errorMessage = "An account with this email already exists"
             isLoading = false
             return
         }
         
         // Validate registration code with DataManager
-        let validation = DataManager.shared.validateRegistrationCode(registrationCode)
+        let validation = dataManager.validateRegistrationCode(registrationCode)
         
         if validation.isValid {
-            DataManager.shared.useRegistrationCode(registrationCode)
+            dataManager.useRegistrationCode(registrationCode)
             
             // Create new user
             let newUser = AppUser(
@@ -1487,18 +1746,10 @@ class AuthService: ObservableObject {
             )
             
             // Add to stored users
-            DataManager.shared.addUser(newUser)
+            dataManager.addUser(newUser)
             
             // Log them in
-            currentUser = User(
-                id: newUser.id,
-                firstName: newUser.firstName,
-                lastName: newUser.lastName,
-                email: newUser.email,
-                groupName: newUser.groupName,
-                isAdmin: newUser.isAdmin
-            )
-            isAuthenticated = true
+            setCurrentUser(from: newUser)
             print("User registered and logged in successfully for team: \(validation.teamName ?? "Unknown")")
         } else {
             errorMessage = "Invalid or expired registration code"
@@ -1510,5 +1761,144 @@ class AuthService: ObservableObject {
     func logout() async {
         currentUser = nil
         isAuthenticated = false
+        refreshBiometricAvailability()
+    }
+}
+
+// MARK: - Biometric Support
+struct BiometricCredentials: Codable {
+    let userId: Int
+    let email: String
+    let appleIdentifier: String?
+}
+
+enum BiometricAuthError: LocalizedError {
+    case biometryUnavailable
+    case authenticationFailed
+    case credentialsNotFound
+    case storage(OSStatus)
+    
+    var errorDescription: String? {
+        switch self {
+        case .biometryUnavailable:
+            return "Biometric authentication is not available on this device."
+        case .authenticationFailed:
+            return "Face ID / Touch ID was canceled or did not succeed."
+        case .credentialsNotFound:
+            return "Biometric login data is missing. Please sign in once with email to re-enable it."
+        case .storage(let status):
+            return "Unable to save biometric credentials (code: \(status))."
+        }
+    }
+}
+
+final class BiometricAuthenticator {
+    static let shared = BiometricAuthenticator()
+    
+    private let service = "com.baseballscout.credentials"
+    private let account = "biometricUser"
+    private init() {}
+    
+    func canEvaluateBiometrics() -> (available: Bool, type: LABiometryType) {
+        let context = LAContext()
+        var error: NSError?
+        let available = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
+        return (available, context.biometryType)
+    }
+    
+    func hasStoredCredentials() -> Bool {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecUseAuthenticationContext as String: context
+        ]
+        let status = SecItemCopyMatching(query as CFDictionary, nil)
+        return status == errSecSuccess || status == errSecInteractionNotAllowed
+    }
+    
+    func store(credentials: BiometricCredentials) throws {
+        guard let access = SecAccessControlCreateWithFlags(
+            nil,
+            kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+            .biometryCurrentSet,
+            nil
+        ) else {
+            throw BiometricAuthError.biometryUnavailable
+        }
+        
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(credentials)
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        
+        SecItemDelete(baseQuery as CFDictionary)
+        var attributes = baseQuery
+        attributes[kSecValueData as String] = data
+        attributes[kSecAttrAccessControl as String] = access
+        
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw BiometricAuthError.storage(status)
+        }
+    }
+    
+    func authenticate(reason: String) async throws -> BiometricCredentials {
+        try await withCheckedThrowingContinuation { continuation in
+            let service = self.service
+            let account = self.account
+            Task.detached(priority: .userInitiated) {
+                let context = LAContext()
+                context.localizedFallbackTitle = "Use Passcode"
+                context.localizedReason = reason
+                
+                let query: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: service,
+                    kSecAttrAccount as String: account,
+                    kSecReturnData as String: true,
+                    kSecMatchLimit as String: kSecMatchLimitOne,
+                    kSecUseAuthenticationContext as String: context
+                ]
+                
+                var item: CFTypeRef?
+                let status = SecItemCopyMatching(query as CFDictionary, &item)
+                
+                switch status {
+                case errSecSuccess:
+                    if let data = item as? Data {
+                        do {
+                            let decoder = JSONDecoder()
+                            let credentials = try decoder.decode(BiometricCredentials.self, from: data)
+                            continuation.resume(returning: credentials)
+                        } catch {
+                            continuation.resume(throwing: error)
+                        }
+                    } else {
+                        continuation.resume(throwing: BiometricAuthError.credentialsNotFound)
+                    }
+                case errSecItemNotFound:
+                    continuation.resume(throwing: BiometricAuthError.credentialsNotFound)
+                case errSecUserCanceled, errSecAuthFailed:
+                    continuation.resume(throwing: BiometricAuthError.authenticationFailed)
+                default:
+                    continuation.resume(throwing: BiometricAuthError.authenticationFailed)
+                }
+            }
+        }
+    }
+    
+    func clearCredentials() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 }
